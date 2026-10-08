@@ -156,9 +156,10 @@ Resources:
                   };
                 }
 
+                const headers = event.headers || {};
+
                 try {
                   const timestamp = new Date().toISOString();
-                  const headers = event.headers || {};
                   await docClient.send(new PutCommand({
                     TableName: process.env.SCANS_TABLE,
                     Item: { 
@@ -172,9 +173,21 @@ Resources:
                   console.error("Failed to log scan:", scanErr);
                 }
 
+                let redirectUrl = getResult.Item.destinationUrl;
+                
+                // Only hijack the route to the App Stores if the URL contains mannkaa.com
+                if (redirectUrl.toLowerCase().includes("mannkaa.com")) {
+                  const userAgent = (headers["user-agent"] || "").toLowerCase();
+                  if (userAgent.includes("android")) {
+                    redirectUrl = "https://play.google.com/store/apps/details?id=com.chatadoc"; 
+                  } else if (userAgent.includes("iphone") || userAgent.includes("ipad") || userAgent.includes("ipod")) {
+                    redirectUrl = "https://apps.apple.com/us/app/mannkaa/id1504060176"; 
+                  }
+                }
+
                 return {
                   statusCode: 302,
-                  headers: { Location: getResult.Item.destinationUrl },
+                  headers: { Location: redirectUrl },
                   body: ""
                 };
               }
