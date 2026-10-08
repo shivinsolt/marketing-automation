@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MannKaa Marketing Platform - MVP QR Redirect & Campaign Manager'
+
+Resources:
+  QRCampaignsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: QRCampaigns
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: qrId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: qrId
+          KeyType: HASH
+
+  QRScansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: QRScans
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: qrId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: qrId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  QRRedirectExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: QRRedirectExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QRRedirectPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt QRCampaignsTable.Arn
+                  - !GetAtt QRScansTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  QRRedirectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: QRRedirectEngine
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt QRRedirectExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          CAMPAIGNS_TABLE: !Ref QRCampaignsTable
+          SCANS_TABLE: !Ref QRScansTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+          const { DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
+          const crypto = require("crypto");
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          exports.handler = async (event) => {
+            console.log("EVENT:", JSON.stringify(event));
+            try {
+              const method = event.requestContext?.http?.method || event.httpMethod || '';
+              const rawPath = event.rawPath || event.path || '';
+
+              // 1. CREATE CAMPAIGN (POST /campaigns)
+              if (method === 'POST' && rawPath.endsWith('/campaigns')) {
+                const body = JSON.parse(event.body || '{}');
+                const { campaignName, destinationUrl } = body;
+
+                if (!destinationUrl) {
+                  return {
+                    statusCode: 400,
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ message: "Missing destinationUrl" })
+                  };
+                }
+
+                const qrId = crypto.randomBytes(4).toString('hex');
+                const createdAt = new Date().toISOString();
+
+                await docClient.send(new PutCommand({
+                  TableName: process.env.CAMPAIGNS_TABLE,
+                  Item: { qrId, campaignName: campaignName || "Untitled Campaign", destinationUrl, createdAt }
+                }));
+
+                return {
+                  statusCode: 200,
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ message: "Campaign created successfully", qrId, destinationUrl })
+                };
+              }
+
+              // 2. LIST CAMPAIGNS (GET /campaigns)
+              if (method === 'GET' && rawPath.endsWith('/campaigns')) {
+                const data = await docClient.send(new ScanCommand({
+                  TableName: process.env.CAMPAIGNS_TABLE
+                }));
+                return {
+                  statusCode: 200,
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(data.Items || [])
+                };
+              }
+
+              // 2.5. LIST SCANS (GET /scans)
+              if (method === 'GET' && rawPath.endsWith('/scans')) {
+                const data = await docClient.send(new ScanCommand({
+                  TableName: process.env.SCANS_TABLE
+                }));
+                return {
+                  statusCode: 200,
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(data.Items || [])
+                };
+              }
+
+              // 3. QR REDIRECT (GET /scan/{qrId})
+              const qrId = event.pathParameters?.qrId;
+              if (method === 'GET' && qrId) {
+                const getResult = await docClient.send(new GetCommand({
+                  TableName: process.env.CAMPAIGNS_TABLE,
+                  Key: { qrId }
+                }));
+
+                if (!getResult.Item || !getResult.Item.destinationUrl) {
+                  return {
+                    statusCode: 404,
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ message: "Campaign not found." })
+                  };
+                }
+
+                try {
+                  const timestamp = new Date().toISOString();
+                  const headers = event.headers || {};
+                  await docClient.send(new PutCommand({
+                    TableName: process.env.SCANS_TABLE,
+                    Item: { 
+                      qrId, 
+                      timestamp, 
+                      userAgent: headers["user-agent"] || "unknown",
+                      country: headers["cloudfront-viewer-country"] || "unknown"
+                    }
+                  }));
+                } catch (scanErr) {
+                  console.error("Failed to log scan:", scanErr);
+                }
+
+                return {
+                  statusCode: 302,
+                  headers: { Location: getResult.Item.destinationUrl },
+                  body: ""
+                };
+              }
+
+              return {
+                statusCode: 404,
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message: "Route not found", path: rawPath, method })
+              };
+            } catch (err) {
+              console.error("Lambda Exception:", err);
+              return {
+                statusCode: 500,
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ error: err.message })
+              };
+            }
+          };
+
+  QRHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: QRMargketingApi
+      ProtocolType: HTTP
+
+  QRHttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref QRHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt QRRedirectFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ScanRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref QRHttpApi
+      RouteKey: 'GET /scan/{qrId}'
+      Target: !Join ['/', ['integrations', !Ref QRHttpApiIntegration]]
+
+  GetScansRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref QRHttpApi
+      RouteKey: 'GET /scans'
+      Target: !Join ['/', ['integrations', !Ref QRHttpApiIntegration]]
+
+  PostCampaignsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref QRHttpApi
+      RouteKey: 'POST /campaigns'
+      Target: !Join ['/', ['integrations', !Ref QRHttpApiIntegration]]
+
+  GetCampaignsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref QRHttpApi
+      RouteKey: 'GET /campaigns'
+      Target: !Join ['/', ['integrations', !Ref QRHttpApiIntegration]]
+
+  QRHttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref QRHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt QRRedirectFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${QRHttpApi}/*/*/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: 'Base URL for your QR Redirects'
+    Value: !Sub '${QRHttpApi.ApiEndpoint}/scan/'
+  BaseApiUrl:
+    Description: 'Base API URL for Appsmith'
+    Value: !Sub '${QRHttpApi.ApiEndpoint}'
