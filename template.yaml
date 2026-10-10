@@ -174,16 +174,19 @@ Resources:
                 }
 
                 let redirectUrl = getResult.Item.destinationUrl;
-                
-                // Only hijack the route to the App Stores if the URL contains mannkaa.com
-                if (redirectUrl.toLowerCase().includes("mannkaa.com")) {
-                  const userAgent = (headers["user-agent"] || "").toLowerCase();
-                  if (userAgent.includes("android")) {
-                    redirectUrl = "https://play.google.com/store/apps/details?id=com.chatadoc"; 
-                  } else if (userAgent.includes("iphone") || userAgent.includes("ipad") || userAgent.includes("ipod")) {
-                    redirectUrl = "https://apps.apple.com/us/app/mannkaa/id1504060176"; 
-                  }
-                }
+            
+            // Normalize URL for comparison (remove trailing slashes, lowercase)
+            const normalizedUrl = redirectUrl.trim().toLowerCase().replace(/\/+$/, "");
+            
+            // Only redirect mobile users to app stores if the destination is strictly the main website
+            if (normalizedUrl === "https://www.mannkaa.com" || normalizedUrl === "https://mannkaa.com") {
+              const userAgent = (headers["user-agent"] || "").toLowerCase();
+              if (userAgent.includes("android")) {
+                redirectUrl = "https://play.google.com/store/apps/details?id=com.chatadoc"; 
+              } else if (userAgent.includes("iphone") || userAgent.includes("ipad") || userAgent.includes("ipod")) {
+                redirectUrl = "https://apps.apple.com/us/app/mannkaa/id1504060176"; 
+              }
+            }
 
                 return {
                   statusCode: 302,
